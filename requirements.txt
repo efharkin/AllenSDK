@@ -21,7 +21,7 @@ glymur==0.8.19
 xarray<0.16.0
 hdmf>=1.0.2,<2.0.0
 pynwb>=1.0.2,<2.0.0
-tables==3.5.1 # pinning this because updates tend to not include wheels immediately
+tables>=3.5.1 # pinning this because updates tend to not include wheels immediately # unpinning this because it is broken
 seaborn<1.0.0
 aiohttp==3.6.2
 nest_asyncio==1.2.0

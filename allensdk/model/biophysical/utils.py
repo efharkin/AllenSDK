@@ -41,6 +41,7 @@ from fractions import gcd
 from skimage.measure import block_reduce
 import scipy.interpolate
 import numpy as np
+import pandas as pd
 from pkg_resources import resource_filename #@UnresolvedImport
 
 PERISOMATIC_TYPE = "Biophysical - perisomatic"
@@ -60,10 +61,10 @@ def create_utils(description, model_type=None):
 
     Returns
     -------
-    Utils instance    
+    Utils instance
     '''
 
-    
+
 
     if model_type is None:
         try:
@@ -72,7 +73,7 @@ def create_utils(description, model_type=None):
             logging.error("Could not infer model type from description")
 
     axon_type = description.data['biophys'][1]['axon_type']
-    
+
     if model_type == PERISOMATIC_TYPE:
         return Utils(description)
     elif model_type == ALL_ACTIVE_TYPE:
@@ -105,7 +106,7 @@ class Utils(HocUtils):
         self.stimulus_sampling_rate = None
 
         self.stim_vec_list = []
-        
+
 
     def update_default_cell_hoc(self, description, default_cell_hoc='cell.hoc'):
         ''' replace the default 'cell.hoc' path in the manifest with 'cell.hoc' packaged
@@ -116,7 +117,7 @@ class Utils(HocUtils):
             hfi = hoc_files.index(default_cell_hoc)
 
             if not os.path.exists(default_cell_hoc):
-                abspath_ch = resource_filename(__name__, 
+                abspath_ch = resource_filename(__name__,
                                                default_cell_hoc)
                 hoc_files[hfi] = abspath_ch
 
@@ -230,7 +231,7 @@ class Utils(HocUtils):
         '''Load current values for a specific experiment sweep and setup simulation
         and stimulus sampling rates.
 
-        NOTE: NEURON only allows simulation timestamps of multiples of 40KHz.  To 
+        NOTE: NEURON only allows simulation timestamps of multiples of 40KHz.  To
         avoid aliasing, we set the simulation sampling rate to the least common
         multiple of the stimulus sampling rate and 40KHz.
 
@@ -270,16 +271,16 @@ class Utils(HocUtils):
         vec["v"].record(self.h.soma[0](0.5)._ref_v)
         vec["t"].record(self.h._ref_t)
 
-        return vec
+        return NeuronRecording(vec["t"], [self.h.soma[0].name], [{'v': vec['v']}])
 
-    def get_recorded_data(self, vec):
-        '''Extract recorded voltages and timestamps given the recorded Vector instance.  
-        If self.stimulus_sampling_rate is smaller than self.simulation_sampling_rate, 
+    def get_recorded_data(self, recording):
+        '''Extract recorded voltages and timestamps given the NeuronRecording instance.
+        If self.stimulus_sampling_rate is smaller than self.simulation_sampling_rate,
         resample to self.stimulus_sampling_rate.
 
         Parameters
         ----------
-        vec : neuron.Vector 
+        vec : NeuronRecording
            constructed by self.record_values
 
         Returns
@@ -288,21 +289,24 @@ class Utils(HocUtils):
 
         '''
         junction_potential = self.description.data['fitting'][0]['junction_potential']
-        
-        v = np.array(vec["v"])
-        t = np.array(vec["t"])
+
+        voltages = np.array([sec['v'] for sec in recording.sections()])
+        assert voltages.ndim == 2
+        t = np.asarray(recording.time)
+        assert np.ndim(t) == 1
+        names = np.asarray(recording.section_names)
 
         if self.stimulus_sampling_rate < self.simulation_sampling_rate:
             factor = self.simulation_sampling_rate / self.stimulus_sampling_rate
-                
+
             Utils._log.debug("subsampling recorded traces by %dX", factor)
-            v = block_reduce(v, (factor,), np.mean)[:len(self.stim_curr)]
+            voltages = block_reduce(voltages, (1, factor), np.mean)[:, :len(self.stim_curr)]
             t = block_reduce(t, (factor,), np.min)[:len(self.stim_curr)]
 
         mV = 1.0e-3
-        v = (v - junction_potential) * mV
-        
-        return { "v": v, "t": t }
+        voltages = (voltages - junction_potential) * mV
+
+        return { "v": voltages, "t": t, "section_names": names}
 
     @staticmethod
     def nearest_neuron_sampling_rate(hz, target_hz=40000):
@@ -312,7 +316,7 @@ class Utils(HocUtils):
 
 
 class AllActiveUtils(Utils):
-    
+
     def __init__(self, description, axon_type):
         """
         Parameters
@@ -323,7 +327,7 @@ class AllActiveUtils(Utils):
                 truncated - diameter of the axon segments is read from .swc (default)
                 stub - diameter of axon segments is 1 micron
             How the axon is replaced within NEURON
-                
+
         """
         super(AllActiveUtils, self).__init__(description)
         self.axon_type = axon_type
@@ -340,7 +344,7 @@ class AllActiveUtils(Utils):
             self._log.info('Replacing axon with a stub : length 60 micron, diameter 1 micron')
             super(AllActiveUtils, self).generate_morphology(morph_filename)
             return
-        
+
         self._log.info('Legacy model - Truncating reconstructed axon after 60 micron')
         morph_basename = os.path.basename(morph_filename)
         morph_extension = morph_basename.split('.')[-1]
@@ -449,3 +453,57 @@ class AllActiveUtils(Utils):
 
         self.h.v_init = conditions['v_init']
         self.h.celsius = conditions['celsius']
+
+    def record_values(self):
+        '''Set up output voltage recording for a biophysically detailed model.'''
+
+        recorded_values = {
+            "t": self.h.Vector(),
+            "section_vectors": [],
+            "section_names": []
+        }
+        recorded_values["t"].record(self.h._ref_t)
+
+        for sec in self.h.allsec():
+            recorded_values["section_names"].append(sec.name())
+
+            sec_vectors = {
+                "v": self.h.Vector()
+            }
+            sec_vectors["v"].record(sec(0.5)._ref_v)
+            recorded_values["section_vectors"].append(sec_vectors)
+
+        return NeuronRecording(
+            recorded_values['t'],
+            recorded_values['section_names'],
+            recorded_values['section_vectors']
+        )
+
+
+class NeuronRecording:
+    def __init__(self, time, section_names, section_vectors):
+        assert len(section_names) == len(section_vectors)
+        self._sections = pd.DataFrame(section_vectors, index=section_names)
+        self.time = time
+
+    @property
+    def section_names(self):
+        return self._sections.index.to_list()
+
+    def sections(self):
+        """Iterator over sections."""
+        for section_name in self.section_names:
+            yield self.get_section_by_name(section_name)
+
+    def get_section_by_name(self, section_name):
+        try:
+            section = self._sections.loc[section_name, :]
+            section["name"] = section_name
+            return section
+        except KeyError:
+            raise KeyError(
+                'NeuronRecording does not have a section called {}'.format(
+                    section_name
+                )
+            )
+

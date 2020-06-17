@@ -59,7 +59,7 @@ class RunSimulate(object):
         self.app_config = Config().load(self.input_json)
         self.manifest = self.app_config.manifest
         fix_sections = ['passive', 'axon_morph,', 'conditions', 'fitting']
-        self.app_config.fix_unary_sections(fix_sections)
+        self.app_config.fix_sections(fix_sections)
 
     def nrnivmodl(self):
         RunSimulate._log.debug("nrnivmodl")

@@ -69,7 +69,7 @@ def run(args, sweeps=None, procs=6):
     '''
 
     description = load_description(args)
-    
+
     prepare_nwb_output(description.manifest.get_path('stimulus_path'),
                        description.manifest.get_path('output_path'))
 
@@ -126,7 +126,7 @@ def run_sync(description, sweeps=None):
         utils.setup_iclamp(stimulus_path, sweep=sweep)
 
         _runner_log.info("Simulating sweep: %d" % (sweep))
-        vec = utils.record_values()
+        recording = utils.record_values('soma')
         tstart = time.time()
         h.finitialize()
         h.run()
@@ -135,11 +135,17 @@ def run_sync(description, sweeps=None):
 
         # write to an NWB File
         _runner_log.info("Writing sweep: %d" % (sweep))
-        recorded_data = utils.get_recorded_data(vec)
+        recorded_voltages = utils.get_recorded_voltages(recording)
+        assert recorded_voltages['v'].shape[0] == 1, (
+            'Expected recorded voltages to have only one row, found {} '
+            'rows instead'.format(recorded_voltages['v'].shape[0])
+        )
 
         if _lock is not None:
             _lock.acquire()
-        save_nwb(output_path, recorded_data["v"], sweep, sweeps_by_type)
+        save_nwb(
+            output_path, recorded_voltages["v"][0, :], sweep, sweeps_by_type
+        )
         if _lock is not None:
             _lock.release()
 
@@ -202,7 +208,7 @@ def load_description(args_dict):
     ----------
     args_dict : dict
         Parsed arguments dictionary with following keys.
-        
+
         manifest_file : string
             .json file with containing the experiment configuration
         axon_type : string
@@ -214,9 +220,9 @@ def load_description(args_dict):
         Object with all information needed to run the experiment.
     '''
     manifest_json_path = args_dict['manifest_file']
-    
+
     description = Config().load(manifest_json_path)
-    
+
     # For newest all-active models update the axon replacement
     axon_replacement_dict = {'axon_type': args_dict.get('axon_type', 'truncated')}
     description.update_data(axon_replacement_dict, 'biophys')

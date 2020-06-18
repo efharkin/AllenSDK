@@ -263,29 +263,52 @@ class Utils(HocUtils):
         if hz != neuron_hz:
             Utils._log.debug("changing sampling rate from %d to %d to avoid NEURON aliasing", hz, neuron_hz)
 
-    def record_values(self):
+    def record_values(self, compartments='soma'):
         '''Set up output voltage recording.'''
-        vec = {"v": self.h.Vector(),
-               "t": self.h.Vector()}
+        if compartments == 'all':
+            names = []
+            vecs = []
+            for sec in self.h.allsec():
+                names.append(sec.name())
 
-        vec["v"].record(self.h.soma[0](0.5)._ref_v)
-        vec["t"].record(self.h._ref_t)
+                v_vec = self.h.Vector()
+                v_vec.record(sec(0.5)._ref_v)
+                vecs.append({'v': v_vec})
 
-        return NeuronRecording(vec["t"], [self.h.soma[0].name], [{'v': vec['v']}])
+        elif compartments == 'soma':
+            names = [self.h.soma[0].name()]
 
-    def get_recorded_data(self, recording):
+            v_vec = self.h.Vector()
+            v_vec.record(self.h.soma[0](0.5)._ref_v)
+            vecs = [{'v': v_vec}]
+
+        else:
+            raise NotImplementedError(
+                'Expected argument `compartments` to be `all` or `soma`, '
+                'got {}'.format(compartments)
+            )
+
+        t_vec = self.h.Vector()
+        t_vec.record(self.h._ref_t)
+
+        return NeuronRecording(t_vec, names, vecs)
+
+    def get_recorded_voltages(self, recording):
         '''Extract recorded voltages and timestamps given the NeuronRecording instance.
         If self.stimulus_sampling_rate is smaller than self.simulation_sampling_rate,
         resample to self.stimulus_sampling_rate.
 
         Parameters
         ----------
-        vec : NeuronRecording
+        recording : NeuronRecording
            constructed by self.record_values
 
         Returns
         -------
-        dict with two keys: 'v' = numpy.ndarray with voltages, 't' = numpy.ndarray with timestamps
+        dict with three keys:
+            'v' = (sections, timesteps) numpy.ndarray with voltages
+            't' = (timesteps,) numpy.ndarray with timestamps
+            'section_names' = iterable of section names
 
         '''
         junction_potential = self.description.data['fitting'][0]['junction_potential']
@@ -306,7 +329,7 @@ class Utils(HocUtils):
         mV = 1.0e-3
         voltages = (voltages - junction_potential) * mV
 
-        return { "v": voltages, "t": t, "section_names": names}
+        return {"v": voltages, "t": t, "section_names": names}
 
     @staticmethod
     def nearest_neuron_sampling_rate(hz, target_hz=40000):
@@ -454,31 +477,6 @@ class AllActiveUtils(Utils):
         self.h.v_init = conditions['v_init']
         self.h.celsius = conditions['celsius']
 
-    def record_values(self):
-        '''Set up output voltage recording for a biophysically detailed model.'''
-
-        recorded_values = {
-            "t": self.h.Vector(),
-            "section_vectors": [],
-            "section_names": []
-        }
-        recorded_values["t"].record(self.h._ref_t)
-
-        for sec in self.h.allsec():
-            recorded_values["section_names"].append(sec.name())
-
-            sec_vectors = {
-                "v": self.h.Vector()
-            }
-            sec_vectors["v"].record(sec(0.5)._ref_v)
-            recorded_values["section_vectors"].append(sec_vectors)
-
-        return NeuronRecording(
-            recorded_values['t'],
-            recorded_values['section_names'],
-            recorded_values['section_vectors']
-        )
-
 
 class NeuronRecording:
     def __init__(self, time, section_names, section_vectors):
@@ -488,7 +486,7 @@ class NeuronRecording:
 
     @property
     def section_names(self):
-        return self._sections.index.to_list()
+        return self._sections.index.to_numpy()
 
     def sections(self):
         """Iterator over sections."""

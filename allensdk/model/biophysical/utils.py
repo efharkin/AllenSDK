@@ -33,6 +33,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 #
+from abc import ABC, abstractmethod
 import logging
 import os
 from ..biophys_sim.neuron.hoc_utils import HocUtils
@@ -42,6 +43,7 @@ from skimage.measure import block_reduce
 import scipy.interpolate
 import numpy as np
 import pandas as pd
+import h5py
 from pkg_resources import resource_filename #@UnresolvedImport
 
 PERISOMATIC_TYPE = "Biophysical - perisomatic"
@@ -267,9 +269,14 @@ class Utils(HocUtils):
         '''Set up output voltage recording.'''
         if compartments == 'all':
             names = []
+            parent_names = []
             vecs = []
             for sec in self.h.allsec():
                 names.append(sec.name())
+                if sec.parentseg() is not None:
+                    parent_names.append(sec.parentseg().sec.name())
+                else:
+                    parent_names.append(None)
 
                 v_vec = self.h.Vector()
                 v_vec.record(sec(0.5)._ref_v)
@@ -277,6 +284,12 @@ class Utils(HocUtils):
 
         elif compartments == 'soma':
             names = [self.h.soma[0].name()]
+            parent_names = []
+            if self.h.soma[0].parentseg() is not None:
+                # This probably shouldn't happen because soma is usually the root
+                parent_names.append(self.h.soma[0].parentseg().sec.name())
+            else:
+                parent_names.append(None)
 
             v_vec = self.h.Vector()
             v_vec.record(self.h.soma[0](0.5)._ref_v)
@@ -291,7 +304,9 @@ class Utils(HocUtils):
         t_vec = self.h.Vector()
         t_vec.record(self.h._ref_t)
 
-        return NeuronRecording(t_vec, names, vecs)
+        return MorphologicalRecording(
+            t_vec, HocMorphology(names, parent_names), vecs
+        )
 
     def get_recorded_voltages(self, recording):
         '''Extract recorded voltages and timestamps given the NeuronRecording instance.
@@ -478,10 +493,57 @@ class AllActiveUtils(Utils):
         self.h.celsius = conditions['celsius']
 
 
-class NeuronRecording:
-    def __init__(self, time, section_names, section_vectors):
-        assert len(section_names) == len(section_vectors)
-        self._sections = pd.DataFrame(section_vectors, index=section_names)
+class H5Saveable(ABC):
+    """Abstract base class for objects that can be save to HDF5 files."""
+
+    def save(self, file_or_h5group):
+        """Save to an HDF5 file or h5py.Group."""
+        if isinstance(file_or_h5group, h5py.Group):
+            self._save_to_h5group(file_or_h5group)
+        elif isinstance(file_or_h5group, str):
+            with h5py.File(file_or_h5group, 'w') as f:
+                self._save_to_h5group(f)
+                f.close()
+        else:
+            raise TypeError(
+                'Expected a str name of file or an h5py.Group, '
+                'got {} instead'.format(type(file_or_h5group))
+            )
+
+    @abstractmethod
+    def _save_to_h5group(self, h5group):
+        NotImplemented
+
+    @staticmethod
+    def load(file_or_h5group):
+        """Load from an HDF5 file or h5py.Group."""
+        if isinstance(file_or_h5group, h5py.Group):
+            return HocMorphology._load_from_h5group(file_or_h5group)
+        elif isinstance(file_or_h5group, str):
+            with h5py.File(file_or_h5group, 'r') as f:
+                loaded = HocMorphology._load_from_h5group(f)
+                f.close()
+            return loaded
+        else:
+            raise TypeError(
+                'Expected a str name of file or an h5py.Group, '
+                'got {} instead'.format(type(file_or_h5group))
+            )
+
+    @staticmethod
+    @abstractmethod
+    def _load_from_h5group(h5group):
+        NotImplemented
+
+
+class MorphologicalRecording:
+    # TODO: Inherit from H5Saveable
+    def __init__(self, time, morphology, section_vectors):
+        assert len(morphology) == len(section_vectors)
+        self.morphology = morphology
+        self._sections = pd.DataFrame(
+            section_vectors, index=morphology.section_names
+        )
         self.time = time
 
     @property
@@ -504,4 +566,105 @@ class NeuronRecording:
                     section_name
                 )
             )
+
+
+class HocMorphology(H5Saveable):
+    """Reduced neural tree morphology used by NEURON."""
+
+    def __init__(self, section_names, parent_names):
+        assert len(section_names) == len(parent_names)
+        self._sections = pd.Series(
+            parent_names, index=section_names, name='parent'
+        )
+
+    def __len__(self):
+        return len(self._sections)
+
+    @property
+    def section_names(self):
+        """Names of all sections in this neuron."""
+        return self._sections.index.to_numpy()
+
+    def sections(self):
+        """Iterator over sections."""
+        for section in self.section_names:
+            yield {
+                'section_name': str(section),
+                'parent_name': str(self.get_parent_by_name(section))
+            }
+
+    def get_parent_by_name(self, section_name, return_type='name'):
+        self._validate_return_type(return_type)
+        try:
+            parent = self._sections.loc[section_name]
+            if return_type == 'name':
+                return str(parent)
+            elif return_type == 'index':
+                return self._name_to_index(parent)
+            else:
+                raise RuntimeError
+        except KeyError:
+            raise KeyError(
+                'HocMorphology does not have a section called {}'.format(
+                    section_name
+                )
+            )
+
+    def get_children_by_name(self, section_name, return_type='name'):
+        self._validate_return_type(return_type)
+
+        # Get the names of all children.
+        child_mask = self._sections == section_name
+        child_names = self._sections.index[child_mask].to_numpy()
+
+        # Return child names or indices, depending on `return_type` argument
+        if return_type == 'name':
+            result = child_names
+        elif return_type == 'index':
+            result = np.array(
+                [self._name_to_index(name) for name in child_names]
+            )
+        else:
+            raise RuntimeError
+
+        return result
+
+    @staticmethod
+    def _validate_return_type(return_type):
+        if return_type not in ['name', 'index']:
+            raise ValueError(
+                'Expected `return_type` to be `name` or `index`, got {} '
+                'instead.'.format(return_type)
+            )
+
+    def _name_to_index(self, section_name):
+        matching_rows = np.where(self._sections.index == section_name)[0]
+
+        if len(matching_rows) == 1:
+            return matching_rows[0]
+        elif len(matching_rows) == 0:
+            raise KeyError('Section {} not found'.format(section_name))
+        else:
+            raise RuntimeError(
+                'Found section {} more than once!'.format(section_name)
+            )
+
+    def _save_to_h5group(self, h5group):
+        h5group.create_dataset(
+            'section_names',
+            data=np.asarray(self._sections.index.to_numpy(), dtype=np.bytes_),
+            dtype=h5py.special_dtype(vlen=str)
+        )
+        h5group.create_dataset(
+            'parent_names',
+            data=np.asarray(self._sections.to_numpy(), dtype=np.bytes_),
+            dtype=h5py.special_dtype(vlen=str)
+        )
+
+    @staticmethod
+    def _load_from_h5group(h5group):
+        names = h5group['section_names'][:]
+        parent_names = h5group['parent_names'][:]
+        return HocMorphology(names, parent_names)
+
 
